@@ -1,0 +1,84 @@
+======================================================================
+I-LVM TRAINING: Integer-Only Latent Variable Model
+======================================================================
+
+Combining:
+  - BitNet b1.58: {-1, 0, 1} ternary weights
+  - ODP Rational: All ops use only +, -, *, /
+======================================================================
+
+Verifying ODP Rational Operators:
+  [x] RationalRMSNorm: Babylonian sqrt (no SFU calls)
+  [x] RationalSiLU: Algebraic sigmoid (no exp)
+  [x] RationalSoftmax: Polynomial exp (no SFU calls)
+  [x] RationalRoPE: Cayley transform (no trig)
+  [x] BitLinear: {-1, 0, 1} weights (additions only)
+
+Result: ZERO transcendental operations!
+GPU: Tesla T4
+Memory: 15.6 GB
+Detected Tesla T4 - using optimized settings
+======================================================================
+I-LVM TRAINING CONFIGURATION
+======================================================================
+
+Model Size: 125M
+  Parameters: 78,734,336
+  FP32 Size: 0.31 GB
+  Training Memory: 1.10 GB
+  Fits T4: Yes
+
+Model Architecture:
+  Hidden dim: 512
+  Intermediate dim: 1536
+  Num heads: 8
+  Num layers: 8
+  Max seq len: 512
+
+Training Settings:
+  Learning rate: 3e-05
+  Batch size: 4
+  Gradient accumulation: 8
+  Effective batch: 32
+  Gradient checkpointing: True
+  Mixed precision: True
+  8-bit Adam: True
+======================================================================
+
+Creating model with ODP rational operators...
+
+Model Statistics:
+  Total parameters: 78,734,848
+  BitLinear layers: 57
+  Ternary params: 52,994,560 (67.3%)
+  Rational RMSNorm: 17
+  Rational SiLU: 8
+  Rational Softmax: 8
+  Rational RoPE: 8
+  Transcendentals: 0 (ZERO!)
+
+Creating data loaders...
+
+Initializing trainer...
+Gradient checkpointing enabled
+µP parameter groups:
+  embedding: 1 params, lr=3.00e-05
+  hidden: 56 params, lr=3.00e-05
+  output: 1 params, lr=3.00e-05
+  other: 17 params, lr=3.00e-05
+Using 8-bit Adam optimizer with µP parameter groups
+Using BF16 mixed precision (no GradScaler needed)
+
+Starting training...
+======================================================================
+I-LVM TRAINING
+======================================================================
+Device: cuda
+Model parameters: 78,734,848
+Batch size: 4
+Gradient accumulation: 8
+Effective batch: 32
+Max steps: 10000
+======================================================================
+Loading tinystories (streaming)...
+Dataset tinystories loaded successfully!

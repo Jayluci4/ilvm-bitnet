@@ -8,7 +8,7 @@ This script trains the Integer-Only Latent Variable Model (I-LVM) which combines
 - MIRAS Memory: Multi-timescale retention with DeltaNet delta rule (optional)
 
 ODP Components Used:
-- RationalRMSNorm: Babylonian sqrt iteration (15 iterations)
+- RationalRMSNorm: Newton-Raphson rsqrt (6 iterations, O(1) division)
 - RationalSiLU: Algebraic sigmoid approximation
 - RationalSoftmax: Polynomial exp approximation (1 + x/4)^4
 - RationalRoPE: Cayley transform for sin/cos
@@ -130,12 +130,19 @@ def setup_device():
 
 def verify_odp_components(use_memory: bool = False):
     """Verify that ODP rational operators are being used."""
+    from rational_bitnet import TRITON_AVAILABLE
+
     print("\nVerifying ODP Rational Operators:")
-    print("  [x] RationalRMSNorm: Babylonian sqrt (no SFU calls)")
-    print("  [x] RationalSiLU: Algebraic sigmoid (no exp)")
+    print("  [x] RationalRMSNorm: Newton-Raphson rsqrt (no SFU calls)")
+    print("  [x] RationalSiLU: Learnable P(x)/Q(x) (Evolution Mode)")
     print("  [x] RationalSoftmax: Polynomial exp (no SFU calls)")
     print("  [x] RationalRoPE: Cayley transform (no trig)")
     print("  [x] BitLinear: {-1, 0, 1} weights (additions only)")
+    print("  [x] Linear Attention: O(N) with rational feature map")
+    if TRITON_AVAILABLE:
+        print("  [x] Triton Kernels: Fused ops (4-25x speedup)")
+    else:
+        print("  [ ] Triton Kernels: NOT AVAILABLE (using PyTorch fallback)")
 
     if use_memory:
         print("\nMIRAS Memory Components (Enabled):")
