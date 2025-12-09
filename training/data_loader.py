@@ -211,67 +211,46 @@ class StreamingTextDataset(IterableDataset):
     def _get_dataset(self):
         """Lazy load dataset with proper distributed sharding.
 
-        Uses staggered loading with retries to avoid race conditions when
-        multiple processes load the same streaming dataset simultaneously.
+        Uses HuggingFace's split_dataset_by_node for race-condition-free sharding
+        of streaming datasets across distributed processes.
         """
         if self._dataset is None:
-            import time
             from datasets import load_dataset
+            try:
+                from datasets.distributed import split_dataset_by_node
+                has_split_by_node = True
+            except ImportError:
+                has_split_by_node = False
+                print(f"[Rank {self.rank}] Warning: split_dataset_by_node not available, using manual sharding")
 
-            # Stagger dataset loading by rank to avoid race conditions
-            # Each rank waits rank * 0.5 seconds before loading
+            load_kwargs = {
+                "path": self.dataset_config.hf_path,
+                "split": self.dataset_config.split,
+                "streaming": True,
+            }
+            if self.dataset_config.hf_config:
+                load_kwargs["name"] = self.dataset_config.hf_config
+
+            print(f"[Rank {self.rank}] Loading {self.dataset_config.name} (streaming)...")
+            self._dataset = load_dataset(**load_kwargs)
+
+            # Apply distributed sharding using the recommended method
             if self.world_size > 1:
-                stagger_delay = self.rank * 0.5
-                print(f"[Rank {self.rank}] Waiting {stagger_delay:.1f}s before loading...")
-                time.sleep(stagger_delay)
+                if has_split_by_node:
+                    # Use HuggingFace's official distributed sharding (no race conditions)
+                    print(f"[Rank {self.rank}] Using split_dataset_by_node: rank {self.rank}/{self.world_size}")
+                    self._dataset = split_dataset_by_node(
+                        self._dataset,
+                        rank=self.rank,
+                        world_size=self.world_size
+                    )
+                else:
+                    # Fallback to manual iteration-based sharding
+                    self._use_manual_sharding = True
+                    print(f"[Rank {self.rank}] Using manual iteration sharding: rank {self.rank}/{self.world_size}")
 
-            max_retries = 3
-            for attempt in range(max_retries):
-                try:
-                    load_kwargs = {
-                        "path": self.dataset_config.hf_path,
-                        "split": self.dataset_config.split,
-                        "streaming": True,
-                    }
-                    if self.dataset_config.hf_config:
-                        load_kwargs["name"] = self.dataset_config.hf_config
-
-                    print(f"[Rank {self.rank}] Loading {self.dataset_config.name} (streaming)...")
-                    self._dataset = load_dataset(**load_kwargs)
-
-                    # Apply distributed sharding at dataset level
-                    # This ensures each GPU gets a unique shard of the data
-                    if self.world_size > 1:
-                        print(f"[Rank {self.rank}] Sharding: rank {self.rank}/{self.world_size}")
-                        self._dataset = self._dataset.shard(
-                            num_shards=self.world_size,
-                            index=self.rank
-                        )
-
-                    self._dataset = self._dataset.shuffle(seed=self.seed + self.rank, buffer_size=10000)
-                    print(f"[Rank {self.rank}] Dataset {self.dataset_config.name} loaded successfully!")
-                    break  # Success, exit retry loop
-
-                except Exception as e:
-                    print(f"[Rank {self.rank}] Attempt {attempt + 1}/{max_retries} failed: {e}")
-                    if attempt < max_retries - 1:
-                        # Wait before retrying with exponential backoff
-                        retry_delay = (attempt + 1) * 2 + self.rank * 0.1
-                        print(f"[Rank {self.rank}] Retrying in {retry_delay:.1f}s...")
-                        time.sleep(retry_delay)
-                    else:
-                        print(f"[Rank {self.rank}] All retries failed, using iteration-based sharding...")
-                        # Fall back to loading without .shard() - we'll do manual sharding in __iter__
-                        try:
-                            self._dataset = load_dataset(**load_kwargs)
-                            self._dataset = self._dataset.shuffle(seed=self.seed + self.rank, buffer_size=10000)
-                            # Mark that we need manual sharding during iteration
-                            self._use_manual_sharding = True
-                            print(f"[Rank {self.rank}] Dataset loaded (will use manual iteration sharding)")
-                        except Exception as e2:
-                            print(f"[Rank {self.rank}] Final fallback failed: {e2}")
-                            print("[Rank {self.rank}] Using synthetic data...")
-                            self._dataset = None
+            self._dataset = self._dataset.shuffle(seed=self.seed + self.rank, buffer_size=10000)
+            print(f"[Rank {self.rank}] Dataset {self.dataset_config.name} loaded successfully!")
 
         return self._dataset
 
