@@ -313,12 +313,6 @@ class AccelerateTrainer:
             if self.global_step >= self.config.max_steps:
                 break
 
-            # Debug: Log iteration start for first 20 batches (covers first optimizer step with grad_accum=16)
-            if batch_idx < 20:
-                self.accelerator.print(f"[Batch {batch_idx}] accum={accum_step}/{self.config.gradient_accumulation_steps}")
-                import sys
-                sys.stdout.flush()
-
             # Determine if this is an accumulation step (no sync) or sync step
             is_accumulation_step = (accum_step + 1) < self.config.gradient_accumulation_steps
 
@@ -327,26 +321,16 @@ class AccelerateTrainer:
                 with self.accelerator.no_sync(self.model):
                     loss = self.train_step(batch)
                     accumulation_loss += loss
-                if batch_idx < 20:
-                    self.accelerator.print(f"[Batch {batch_idx}] loss={loss:.4f}")
                 accum_step += 1
             else:
                 # Final accumulation step - allow gradient sync across GPUs
-                if batch_idx < 20:
-                    self.accelerator.print(f"[Batch {batch_idx}] SYNC step - calling train_step with gradient sync...")
-                    sys.stdout.flush()
                 loss = self.train_step(batch)
                 accumulation_loss += loss
 
-                if batch_idx < 20:
-                    self.accelerator.print(f"[Batch {batch_idx}] train_step done, calling optimizer_step...")
-                    sys.stdout.flush()
-                # Now do optimizer step
+                # Optimizer step after gradient sync
                 self.optimizer_step()
                 self.global_step += 1
                 accum_step = 0  # Reset accumulation counter
-                if batch_idx < 20:
-                    self.accelerator.print(f"[Batch {batch_idx}] Step {self.global_step} COMPLETE!")
 
                 step_time = time.perf_counter() - step_start
                 step_times.append(step_time)
