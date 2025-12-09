@@ -35,11 +35,13 @@ mkdir -p checkpoints
 if [ "$USE_MEMORY" == "--use_memory" ]; then
     echo "Training with MIRAS memory enabled"
     echo "NOTE: Using reduced batch_size=4 and seq_len=1024 for MIRAS memory overhead"
+    echo "Dataset: TinyStories (Stage 1 validation)"
     accelerate launch \
         --config_file scripts/accelerate_config_8l4.yaml \
         training/train_accelerate.py \
         --model_size "$MODEL_SIZE" \
         --use_memory \
+        --dataset tinystories \
         --batch_size 4 \
         --gradient_accumulation 8 \
         --max_seq_len 1024 \
@@ -51,10 +53,12 @@ if [ "$USE_MEMORY" == "--use_memory" ]; then
         --save_every 2500
 else
     echo "Training without MIRAS memory"
+    echo "Dataset: TinyStories (Stage 1 validation)"
     accelerate launch \
         --config_file scripts/accelerate_config_8l4.yaml \
         training/train_accelerate.py \
         --model_size "$MODEL_SIZE" \
+        --dataset tinystories \
         --batch_size 16 \
         --gradient_accumulation 4 \
         --max_seq_len 2048 \
