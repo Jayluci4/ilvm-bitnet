@@ -295,9 +295,21 @@ class AccelerateTrainer:
         self.accelerator.print("Starting training loop...")
         self.accelerator.print("Waiting for first batch from dataloader...")
 
-        for batch_idx, batch in enumerate(self.train_dataloader):
-            if batch_idx == 0:
-                self.accelerator.print(f"First batch received! Shape: {batch['input_ids'].shape}")
+        # Pre-fetch first batch and synchronize all ranks before training
+        # This prevents deadlock when ranks load streaming data at different speeds
+        data_iter = iter(self.train_dataloader)
+        first_batch = next(data_iter)
+        self.accelerator.print(f"First batch received! Shape: {first_batch['input_ids'].shape}")
+
+        # CRITICAL: Wait for all ranks to have their first batch before training
+        self.accelerator.wait_for_everyone()
+        self.accelerator.print("All ranks synchronized. Starting training...")
+
+        # Process first batch, then continue with iterator
+        import itertools
+        all_batches = itertools.chain([first_batch], data_iter)
+
+        for batch_idx, batch in enumerate(all_batches):
             if self.global_step >= self.config.max_steps:
                 break
 
