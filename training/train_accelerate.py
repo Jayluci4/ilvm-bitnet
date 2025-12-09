@@ -400,12 +400,15 @@ def main():
     optimizer = create_optimizer(model, config)
     scheduler = create_scheduler(optimizer, config, config.max_steps)
 
-    # Create data loaders (streaming is enabled by default in data_loader.py)
+    # Create data loaders with distributed sharding
+    # Pass rank/world_size to ensure each GPU gets different data
     accelerator.print("Creating data loaders...")
     train_dataloader = create_dataloader(
         dataset_name=config.dataset_name,
         batch_size=config.batch_size,
         max_seq_len=config.max_seq_len,
+        rank=accelerator.process_index,
+        world_size=accelerator.num_processes,
     )
 
     eval_dataloader = create_dataloader(
@@ -413,6 +416,8 @@ def main():
         batch_size=config.eval_batch_size,
         max_seq_len=config.max_seq_len,
         split="validation",
+        rank=accelerator.process_index,
+        world_size=accelerator.num_processes,
     )
 
     # Create trainer

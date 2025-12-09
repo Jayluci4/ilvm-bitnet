@@ -183,6 +183,7 @@ class StreamingTextDataset(IterableDataset):
     - Tokenizes on-the-fly to save memory
     - Packs multiple short sequences for efficiency
     - Handles sequence length properly
+    - Supports distributed training (shards data across GPUs)
     """
 
     def __init__(
@@ -193,6 +194,8 @@ class StreamingTextDataset(IterableDataset):
         vocab_size: int = 32000,
         seed: int = 42,
         max_samples: Optional[int] = None,
+        rank: int = 0,
+        world_size: int = 1,
     ):
         self.dataset_config = dataset_config
         self.max_seq_len = max_seq_len
@@ -200,6 +203,8 @@ class StreamingTextDataset(IterableDataset):
         self.vocab_size = vocab_size
         self.seed = seed
         self.max_samples = max_samples
+        self.rank = rank
+        self.world_size = world_size
         self._dataset = None
 
     def _get_dataset(self):
@@ -247,22 +252,27 @@ class StreamingTextDataset(IterableDataset):
         }
 
     def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
-        """Iterate over tokenized samples."""
+        """Iterate over tokenized samples with distributed sharding."""
         dataset = self._get_dataset()
 
         if dataset is None:
             # Synthetic data fallback
             sample_count = 0
+            global_count = 0
             while True:
                 if self.max_samples and sample_count >= self.max_samples:
                     break
-                yield self._generate_synthetic_sample()
-                sample_count += 1
+                # Shard synthetic data: only yield if global_count % world_size == rank
+                if global_count % self.world_size == self.rank:
+                    yield self._generate_synthetic_sample()
+                    sample_count += 1
+                global_count += 1
             return
 
         # Buffer for packing sequences
         token_buffer = []
         sample_count = 0
+        global_sample_count = 0  # Track across all ranks
         text_field = self.dataset_config.text_field
 
         for example in dataset:
@@ -282,18 +292,22 @@ class StreamingTextDataset(IterableDataset):
             tokens = self._tokenize(text)
             token_buffer.extend(tokens)
 
-            # Yield complete sequences
+            # Yield complete sequences with distributed sharding
             while len(token_buffer) >= self.max_seq_len:
                 sequence = token_buffer[:self.max_seq_len]
                 token_buffer = token_buffer[self.max_seq_len:]
 
-                input_ids = torch.tensor(sequence, dtype=torch.long)
-                yield {
-                    "input_ids": input_ids,
-                    "labels": input_ids.clone(),
-                    "attention_mask": torch.ones(self.max_seq_len),
-                }
-                sample_count += 1
+                # Only yield if this sample belongs to this rank
+                if global_sample_count % self.world_size == self.rank:
+                    input_ids = torch.tensor(sequence, dtype=torch.long)
+                    yield {
+                        "input_ids": input_ids,
+                        "labels": input_ids.clone(),
+                        "attention_mask": torch.ones(self.max_seq_len),
+                    }
+                    sample_count += 1
+
+                global_sample_count += 1
 
                 if self.max_samples and sample_count >= self.max_samples:
                     break
@@ -353,6 +367,8 @@ def create_dataloader(
     use_synthetic: bool = False,
     seed: int = 42,
     max_samples: Optional[int] = None,
+    rank: int = 0,
+    world_size: int = 1,
 ) -> DataLoader:
     """Create a memory-efficient data loader.
 
@@ -402,6 +418,8 @@ def create_dataloader(
             vocab_size=vocab_size,
             seed=seed,
             max_samples=max_samples,
+            rank=rank,
+            world_size=world_size,
         )
 
     return DataLoader(
