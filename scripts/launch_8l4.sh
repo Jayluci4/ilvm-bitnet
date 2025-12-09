@@ -34,14 +34,15 @@ mkdir -p checkpoints
 # Run with Accelerate
 if [ "$USE_MEMORY" == "--use_memory" ]; then
     echo "Training with MIRAS memory enabled"
+    echo "NOTE: Using reduced batch_size=4 and seq_len=1024 for MIRAS memory overhead"
     accelerate launch \
         --config_file scripts/accelerate_config_8l4.yaml \
         training/train_accelerate.py \
         --model_size "$MODEL_SIZE" \
         --use_memory \
-        --batch_size 16 \
-        --gradient_accumulation 4 \
-        --max_seq_len 2048 \
+        --batch_size 4 \
+        --gradient_accumulation 8 \
+        --max_seq_len 1024 \
         --learning_rate 1e-4 \
         --warmup_steps 4000 \
         --max_steps 200000 \
