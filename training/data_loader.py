@@ -206,40 +206,72 @@ class StreamingTextDataset(IterableDataset):
         self.rank = rank
         self.world_size = world_size
         self._dataset = None
+        self._use_manual_sharding = False  # Set to True if .shard() fails
 
     def _get_dataset(self):
-        """Lazy load dataset with proper distributed sharding."""
+        """Lazy load dataset with proper distributed sharding.
+
+        Uses staggered loading with retries to avoid race conditions when
+        multiple processes load the same streaming dataset simultaneously.
+        """
         if self._dataset is None:
-            try:
-                from datasets import load_dataset
+            import time
+            from datasets import load_dataset
 
-                load_kwargs = {
-                    "path": self.dataset_config.hf_path,
-                    "split": self.dataset_config.split,
-                    "streaming": True,
-                }
-                if self.dataset_config.hf_config:
-                    load_kwargs["name"] = self.dataset_config.hf_config
+            # Stagger dataset loading by rank to avoid race conditions
+            # Each rank waits rank * 0.5 seconds before loading
+            if self.world_size > 1:
+                stagger_delay = self.rank * 0.5
+                print(f"[Rank {self.rank}] Waiting {stagger_delay:.1f}s before loading...")
+                time.sleep(stagger_delay)
 
-                print(f"Loading {self.dataset_config.name} (streaming)...")
-                self._dataset = load_dataset(**load_kwargs)
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    load_kwargs = {
+                        "path": self.dataset_config.hf_path,
+                        "split": self.dataset_config.split,
+                        "streaming": True,
+                    }
+                    if self.dataset_config.hf_config:
+                        load_kwargs["name"] = self.dataset_config.hf_config
 
-                # Apply distributed sharding at dataset level (proper HuggingFace way)
-                # This ensures each GPU gets a unique shard of the data
-                if self.world_size > 1:
-                    print(f"  Sharding for distributed training: rank {self.rank}/{self.world_size}")
-                    self._dataset = self._dataset.shard(
-                        num_shards=self.world_size,
-                        index=self.rank
-                    )
+                    print(f"[Rank {self.rank}] Loading {self.dataset_config.name} (streaming)...")
+                    self._dataset = load_dataset(**load_kwargs)
 
-                self._dataset = self._dataset.shuffle(seed=self.seed + self.rank, buffer_size=10000)
-                print(f"Dataset {self.dataset_config.name} loaded successfully!")
+                    # Apply distributed sharding at dataset level
+                    # This ensures each GPU gets a unique shard of the data
+                    if self.world_size > 1:
+                        print(f"[Rank {self.rank}] Sharding: rank {self.rank}/{self.world_size}")
+                        self._dataset = self._dataset.shard(
+                            num_shards=self.world_size,
+                            index=self.rank
+                        )
 
-            except Exception as e:
-                print(f"Failed to load {self.dataset_config.name}: {e}")
-                print("Falling back to synthetic data for testing...")
-                self._dataset = None
+                    self._dataset = self._dataset.shuffle(seed=self.seed + self.rank, buffer_size=10000)
+                    print(f"[Rank {self.rank}] Dataset {self.dataset_config.name} loaded successfully!")
+                    break  # Success, exit retry loop
+
+                except Exception as e:
+                    print(f"[Rank {self.rank}] Attempt {attempt + 1}/{max_retries} failed: {e}")
+                    if attempt < max_retries - 1:
+                        # Wait before retrying with exponential backoff
+                        retry_delay = (attempt + 1) * 2 + self.rank * 0.1
+                        print(f"[Rank {self.rank}] Retrying in {retry_delay:.1f}s...")
+                        time.sleep(retry_delay)
+                    else:
+                        print(f"[Rank {self.rank}] All retries failed, using iteration-based sharding...")
+                        # Fall back to loading without .shard() - we'll do manual sharding in __iter__
+                        try:
+                            self._dataset = load_dataset(**load_kwargs)
+                            self._dataset = self._dataset.shuffle(seed=self.seed + self.rank, buffer_size=10000)
+                            # Mark that we need manual sharding during iteration
+                            self._use_manual_sharding = True
+                            print(f"[Rank {self.rank}] Dataset loaded (will use manual iteration sharding)")
+                        except Exception as e2:
+                            print(f"[Rank {self.rank}] Final fallback failed: {e2}")
+                            print("[Rank {self.rank}] Using synthetic data...")
+                            self._dataset = None
 
         return self._dataset
 
@@ -265,14 +297,16 @@ class StreamingTextDataset(IterableDataset):
         """Iterate over tokenized samples.
 
         Note: Distributed sharding is handled at the dataset level via .shard()
-        in _get_dataset(), so no manual sharding is needed here.
+        in _get_dataset(). If .shard() failed, we fall back to manual iteration-based
+        sharding where each rank only processes examples where (example_count % world_size == rank).
         """
         print(f"[Rank {self.rank}] Starting __iter__...")
         dataset = self._get_dataset()
-        print(f"[Rank {self.rank}] Dataset obtained, starting iteration...")
+        print(f"[Rank {self.rank}] Dataset obtained (manual_sharding={self._use_manual_sharding})")
 
         if dataset is None:
             # Synthetic data fallback - apply sharding for synthetic data
+            print(f"[Rank {self.rank}] Using synthetic data fallback...")
             sample_count = 0
             global_count = 0
             while True:
@@ -290,12 +324,20 @@ class StreamingTextDataset(IterableDataset):
         sample_count = 0
         text_field = self.dataset_config.text_field
         example_count = 0
+        global_sequence_count = 0  # For manual sharding of output sequences
 
         print(f"[Rank {self.rank}] Starting to iterate over dataset...")
         for example in dataset:
             if example_count == 0:
                 print(f"[Rank {self.rank}] First example received!")
             example_count += 1
+
+            # Manual sharding at example level if .shard() failed
+            # This is less efficient but ensures each rank gets unique data
+            if self._use_manual_sharding and self.world_size > 1:
+                if example_count % self.world_size != self.rank:
+                    continue  # Skip examples not assigned to this rank
+
             if self.max_samples and sample_count >= self.max_samples:
                 break
 
@@ -312,7 +354,7 @@ class StreamingTextDataset(IterableDataset):
             tokens = self._tokenize(text)
             token_buffer.extend(tokens)
 
-            # Yield complete sequences (dataset already sharded via .shard())
+            # Yield complete sequences
             while len(token_buffer) >= self.max_seq_len:
                 sequence = token_buffer[:self.max_seq_len]
                 token_buffer = token_buffer[self.max_seq_len:]
@@ -328,9 +370,12 @@ class StreamingTextDataset(IterableDataset):
                     "attention_mask": torch.ones(self.max_seq_len),
                 }
                 sample_count += 1
+                global_sequence_count += 1
 
                 if self.max_samples and sample_count >= self.max_samples:
                     break
+
+        print(f"[Rank {self.rank}] Iteration complete: {sample_count} sequences yielded from {example_count} examples")
 
 
 class SyntheticDataset(IterableDataset):
