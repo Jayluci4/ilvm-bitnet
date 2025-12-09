@@ -267,7 +267,9 @@ class StreamingTextDataset(IterableDataset):
         Note: Distributed sharding is handled at the dataset level via .shard()
         in _get_dataset(), so no manual sharding is needed here.
         """
+        print(f"[Rank {self.rank}] Starting __iter__...")
         dataset = self._get_dataset()
+        print(f"[Rank {self.rank}] Dataset obtained, starting iteration...")
 
         if dataset is None:
             # Synthetic data fallback - apply sharding for synthetic data
@@ -287,8 +289,13 @@ class StreamingTextDataset(IterableDataset):
         token_buffer = []
         sample_count = 0
         text_field = self.dataset_config.text_field
+        example_count = 0
 
+        print(f"[Rank {self.rank}] Starting to iterate over dataset...")
         for example in dataset:
+            if example_count == 0:
+                print(f"[Rank {self.rank}] First example received!")
+            example_count += 1
             if self.max_samples and sample_count >= self.max_samples:
                 break
 
@@ -311,6 +318,10 @@ class StreamingTextDataset(IterableDataset):
                 token_buffer = token_buffer[self.max_seq_len:]
 
                 input_ids = torch.tensor(sequence, dtype=torch.long)
+
+                if sample_count == 0:
+                    print(f"[Rank {self.rank}] Yielding first full sequence!")
+
                 yield {
                     "input_ids": input_ids,
                     "labels": input_ids.clone(),

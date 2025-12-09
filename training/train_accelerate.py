@@ -118,13 +118,30 @@ class AccelerateTrainer:
         self.config = config
         self.accelerator = accelerator
 
-        # Prepare for distributed training - Accelerate handles all DDP wrapping
-        self.model, self.optimizer, self.train_dataloader, self.scheduler = accelerator.prepare(
-            model, optimizer, train_dataloader, scheduler
+        # Prepare model, optimizer, scheduler for distributed training
+        # NOTE: For streaming datasets that are already sharded via .shard(),
+        # we DON'T let Accelerate wrap the dataloader (it would try to add
+        # DistributedSampler which doesn't work with IterableDatasets)
+        self.model, self.optimizer, self.scheduler = accelerator.prepare(
+            model, optimizer, scheduler
         )
 
+        # For streaming datasets, prepare dataloader with proper settings
+        # dispatch_batches=False: don't try to dispatch batches across processes
+        # split_batches=False: each process gets its own complete batches
+        from torch.utils.data import IterableDataset
+        if isinstance(train_dataloader.dataset, IterableDataset):
+            accelerator.print("Detected streaming/iterable dataset - using manual sharding")
+            # Don't wrap - dataset is already sharded via .shard() in data_loader.py
+            self.train_dataloader = train_dataloader
+        else:
+            self.train_dataloader = accelerator.prepare(train_dataloader)
+
         if eval_dataloader is not None:
-            self.eval_dataloader = accelerator.prepare(eval_dataloader)
+            if isinstance(eval_dataloader.dataset, IterableDataset):
+                self.eval_dataloader = eval_dataloader
+            else:
+                self.eval_dataloader = accelerator.prepare(eval_dataloader)
         else:
             self.eval_dataloader = None
 
@@ -135,8 +152,11 @@ class AccelerateTrainer:
         """Single training step."""
         self.model.train()
 
-        input_ids = batch['input_ids']
+        # Move batch to device (needed when not using Accelerate dataloader wrapping)
+        input_ids = batch['input_ids'].to(self.accelerator.device)
         labels = batch.get('labels', input_ids[:, 1:])
+        if isinstance(labels, torch.Tensor):
+            labels = labels.to(self.accelerator.device)
 
         # Forward with mixed precision (handled by Accelerate)
         outputs = self.model(input_ids)
@@ -190,8 +210,11 @@ class AccelerateTrainer:
         num_batches = 0
 
         for batch in self.eval_dataloader:
-            input_ids = batch['input_ids']
+            # Move batch to device (needed when not using Accelerate dataloader wrapping)
+            input_ids = batch['input_ids'].to(self.accelerator.device)
             labels = batch.get('labels', input_ids[:, 1:])
+            if isinstance(labels, torch.Tensor):
+                labels = labels.to(self.accelerator.device)
 
             outputs = self.model(input_ids)
             # Handle different output formats: dict (UnifiedILVM), tuple, or tensor
@@ -258,7 +281,12 @@ class AccelerateTrainer:
         accumulation_loss = 0.0
         step_times = []
 
+        self.accelerator.print("Starting training loop...")
+        self.accelerator.print("Waiting for first batch from dataloader...")
+
         for batch_idx, batch in enumerate(self.train_dataloader):
+            if batch_idx == 0:
+                self.accelerator.print(f"First batch received! Shape: {batch['input_ids'].shape}")
             if self.global_step >= self.config.max_steps:
                 break
 
