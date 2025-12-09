@@ -26,7 +26,7 @@ from torch.amp import autocast  # Use torch.amp for BF16 support
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from rational_bitnet import RationalBitNet, RationalBitNetConfig
+from rational_bitnet import RationalBitNet, RationalBitNetConfig, compute_sparsity_penalty
 
 
 class GradientCheckpointWrapper(nn.Module):
@@ -408,6 +408,16 @@ class ILVMTrainer:
                     # Reset NaN counter on good loss
                     self.nan_count = 0
 
+                    # Zero-Sparsity Trap Fix: Add penalty if >80% weights are zero
+                    sparsity_penalty, high_sparsity_layers, avg_sparsity = compute_sparsity_penalty(
+                        self.model, threshold=0.8, penalty_weight=0.01
+                    )
+                    if high_sparsity_layers > 0:
+                        loss = loss + sparsity_penalty
+                        # Log occasionally
+                        if self.global_step % (self.train_config.log_every * 10) == 0:
+                            print(f"  Sparsity: {avg_sparsity:.1%}, {high_sparsity_layers} layers > 80%")
+
                     # Scale loss for gradient accumulation
                     loss = loss / self.train_config.gradient_accumulation_steps
 
@@ -431,6 +441,16 @@ class ILVMTrainer:
                     return 0.0, False
 
                 self.nan_count = 0
+
+                # Zero-Sparsity Trap Fix: Add penalty if >80% weights are zero
+                sparsity_penalty, high_sparsity_layers, avg_sparsity = compute_sparsity_penalty(
+                    self.model, threshold=0.8, penalty_weight=0.01
+                )
+                if high_sparsity_layers > 0:
+                    loss = loss + sparsity_penalty
+                    if self.global_step % (self.train_config.log_every * 10) == 0:
+                        print(f"  Sparsity: {avg_sparsity:.1%}, {high_sparsity_layers} layers > 80%")
+
                 loss = loss / self.train_config.gradient_accumulation_steps
                 loss.backward()
 

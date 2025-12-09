@@ -66,12 +66,17 @@ def parse_args():
         help="Use Unified I-LVM with MIRAS memory (multi-timescale retention + DeltaNet)",
     )
 
-    # Training configuration
-    parser.add_argument("--learning_rate", type=float, default=5e-5)
+    # Training configuration (Physics-Correct for Rational Networks)
+    # 0.1x LR Rule: Polynomials amplify gradients more than exp
+    parser.add_argument("--learning_rate", type=float, default=5e-5,
+                        help="0.1x standard LR for rational operators")
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--gradient_accumulation", type=int, default=8)
     parser.add_argument("--max_steps", type=int, default=100000)
-    parser.add_argument("--warmup_steps", type=int, default=1000)
+    parser.add_argument("--warmup_steps", type=int, default=2000,
+                        help="Extended warmup for rational networks (4x typical)")
+    parser.add_argument("--gradient_clip", type=float, default=0.5,
+                        help="Aggressive clipping for polynomial gradient scaling")
     parser.add_argument("--max_seq_len", type=int, default=512)
 
     # Memory optimizations
@@ -184,7 +189,7 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.manual_seed(args.seed)
 
-    # Create configurations
+    # Create configurations (Physics-Correct for Rational Networks)
     train_config = T4Config(
         model_size=args.model_size,
         learning_rate=args.learning_rate,
@@ -192,6 +197,7 @@ def main():
         gradient_accumulation_steps=args.gradient_accumulation,
         max_steps=args.max_steps,
         warmup_steps=args.warmup_steps,
+        gradient_clip=args.gradient_clip,  # 0.5 for polynomial gradient scaling
         max_seq_len=args.max_seq_len,
         use_gradient_checkpointing=not args.no_gradient_checkpointing,
         use_mixed_precision=not args.no_mixed_precision,
