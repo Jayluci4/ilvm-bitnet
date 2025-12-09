@@ -208,7 +208,7 @@ class StreamingTextDataset(IterableDataset):
         self._dataset = None
 
     def _get_dataset(self):
-        """Lazy load dataset."""
+        """Lazy load dataset with proper distributed sharding."""
         if self._dataset is None:
             try:
                 from datasets import load_dataset
@@ -223,7 +223,17 @@ class StreamingTextDataset(IterableDataset):
 
                 print(f"Loading {self.dataset_config.name} (streaming)...")
                 self._dataset = load_dataset(**load_kwargs)
-                self._dataset = self._dataset.shuffle(seed=self.seed, buffer_size=10000)
+
+                # Apply distributed sharding at dataset level (proper HuggingFace way)
+                # This ensures each GPU gets a unique shard of the data
+                if self.world_size > 1:
+                    print(f"  Sharding for distributed training: rank {self.rank}/{self.world_size}")
+                    self._dataset = self._dataset.shard(
+                        num_shards=self.world_size,
+                        index=self.rank
+                    )
+
+                self._dataset = self._dataset.shuffle(seed=self.seed + self.rank, buffer_size=10000)
                 print(f"Dataset {self.dataset_config.name} loaded successfully!")
 
             except Exception as e:
@@ -252,11 +262,15 @@ class StreamingTextDataset(IterableDataset):
         }
 
     def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
-        """Iterate over tokenized samples with distributed sharding."""
+        """Iterate over tokenized samples.
+
+        Note: Distributed sharding is handled at the dataset level via .shard()
+        in _get_dataset(), so no manual sharding is needed here.
+        """
         dataset = self._get_dataset()
 
         if dataset is None:
-            # Synthetic data fallback
+            # Synthetic data fallback - apply sharding for synthetic data
             sample_count = 0
             global_count = 0
             while True:
@@ -272,7 +286,6 @@ class StreamingTextDataset(IterableDataset):
         # Buffer for packing sequences
         token_buffer = []
         sample_count = 0
-        global_sample_count = 0  # Track across all ranks
         text_field = self.dataset_config.text_field
 
         for example in dataset:
@@ -292,22 +305,18 @@ class StreamingTextDataset(IterableDataset):
             tokens = self._tokenize(text)
             token_buffer.extend(tokens)
 
-            # Yield complete sequences with distributed sharding
+            # Yield complete sequences (dataset already sharded via .shard())
             while len(token_buffer) >= self.max_seq_len:
                 sequence = token_buffer[:self.max_seq_len]
                 token_buffer = token_buffer[self.max_seq_len:]
 
-                # Only yield if this sample belongs to this rank
-                if global_sample_count % self.world_size == self.rank:
-                    input_ids = torch.tensor(sequence, dtype=torch.long)
-                    yield {
-                        "input_ids": input_ids,
-                        "labels": input_ids.clone(),
-                        "attention_mask": torch.ones(self.max_seq_len),
-                    }
-                    sample_count += 1
-
-                global_sample_count += 1
+                input_ids = torch.tensor(sequence, dtype=torch.long)
+                yield {
+                    "input_ids": input_ids,
+                    "labels": input_ids.clone(),
+                    "attention_mask": torch.ones(self.max_seq_len),
+                }
+                sample_count += 1
 
                 if self.max_samples and sample_count >= self.max_samples:
                     break
