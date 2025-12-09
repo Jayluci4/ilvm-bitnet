@@ -140,7 +140,13 @@ class AccelerateTrainer:
 
         # Forward with mixed precision (handled by Accelerate)
         outputs = self.model(input_ids)
-        logits = outputs[0] if isinstance(outputs, tuple) else outputs
+        # Handle different output formats: dict (UnifiedILVM), tuple, or tensor
+        if isinstance(outputs, dict):
+            logits = outputs["logits"]
+        elif isinstance(outputs, tuple):
+            logits = outputs[0]
+        else:
+            logits = outputs
 
         # Compute loss
         shift_logits = logits[:, :-1, :].contiguous()
@@ -187,7 +193,13 @@ class AccelerateTrainer:
             labels = batch.get('labels', input_ids[:, 1:])
 
             outputs = self.model(input_ids)
-            logits = outputs[0] if isinstance(outputs, tuple) else outputs
+            # Handle different output formats: dict (UnifiedILVM), tuple, or tensor
+            if isinstance(outputs, dict):
+                logits = outputs["logits"]
+            elif isinstance(outputs, tuple):
+                logits = outputs[0]
+            else:
+                logits = outputs
 
             shift_logits = logits[:, :-1, :].contiguous()
             shift_labels = labels.contiguous()
@@ -306,8 +318,8 @@ class AccelerateTrainer:
 
 def main():
     parser = argparse.ArgumentParser(description="Accelerate Training for BitNet-ODP")
-    parser.add_argument("--model_size", type=str, default="1B",
-                        choices=["350M", "1B", "3B", "7B"])
+    parser.add_argument("--model_size", type=str, default="125M",
+                        choices=["125M", "350M", "1B", "3B", "7B"])
     parser.add_argument("--dataset", type=str, default="c4")
     parser.add_argument("--max_steps", type=int, default=200000)
     parser.add_argument("--batch_size", type=int, default=16)
