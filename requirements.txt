@@ -1,0 +1,33 @@
+# BitNet-ODP: Integer-Only LVM with MIRAS Memory
+# Requirements for multi-GPU L4 training
+
+# Core ML Framework
+torch>=2.1.0
+triton>=2.1.0
+
+# HuggingFace
+transformers>=4.35.0
+datasets>=2.14.0
+tokenizers>=0.14.0
+
+# Optimizers
+bitsandbytes>=0.41.0
+
+# Distributed Training
+accelerate>=0.24.0
+
+# Logging and Monitoring
+wandb>=0.15.0
+tensorboard>=2.14.0
+
+# Utilities
+numpy>=1.24.0
+tqdm>=4.65.0
+pyyaml>=6.0
+
+# Development
+pytest>=7.4.0
+pytest-cov>=4.1.0
+
+# Optional: Flash Linear Attention (for Triton-optimized DeltaNet)
+# pip install flash-linear-attention

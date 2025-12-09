@@ -1,14 +1,15 @@
 """
-T4-Optimized Training Configuration
+Training Configuration for Tesla T4 and L4 GPUs
 
-Memory budget for Tesla T4 (15.6GB):
-- Model weights: ~500MB for 125M params in FP32
-- Gradients: ~500MB (same as weights)
-- Optimizer states (8-bit Adam): ~250MB (0.5x weights)
-- Activations: Variable based on batch size and seq_len
-- CUDA kernels/overhead: ~1GB
+Memory budget:
+- Tesla T4 (15.6GB): 125M-350M models (single GPU)
+- NVIDIA L4 (24GB): 350M-1B models (single GPU), 1B-7B with 8x L4 DDP
 
-With gradient checkpointing, we can train 125M-350M models on T4.
+L4 Ada Architecture Optimizations:
+- 4th gen Tensor Cores with TF32 support
+- Native BF16 with 2x throughput vs FP16
+- PCIe Gen4 bandwidth for multi-GPU
+- Supports gradient checkpointing for 7B+ models
 """
 
 import sys
@@ -66,6 +67,88 @@ class T4Config:
 
 
 @dataclass
+class L4Config:
+    """Training configuration optimized for NVIDIA L4 GPU (24GB VRAM) with DDP.
+
+    L4 Ada Architecture (SM89):
+    - 4th gen Tensor Cores: TF32 and BF16 support
+    - 24GB GDDR6 with 300 GB/s bandwidth
+    - PCIe Gen4 x16 for multi-GPU communication
+    - Optimal for inference and training workloads
+    """
+
+    # Model size presets for L4
+    model_size: str = "1B"  # Options: "350M", "1B", "3B", "7B"
+
+    # Training hyperparameters (scaled for larger models)
+    learning_rate: float = 1e-4  # Higher LR for larger batch sizes
+    weight_decay: float = 0.1
+    warmup_steps: int = 4000  # Longer warmup for large models
+    max_steps: int = 200000
+    gradient_clip: float = 1.0  # Relaxed for stable training
+
+    # Memory optimization
+    gradient_accumulation_steps: int = 4  # Less needed with 8 GPUs
+    use_gradient_checkpointing: bool = True
+    use_mixed_precision: bool = True  # BF16 native on L4
+    use_8bit_adam: bool = True
+
+    # Batch sizes (per GPU, before accumulation)
+    batch_size: int = 16  # 4x larger than T4
+    eval_batch_size: int = 32
+
+    # Sequence length
+    max_seq_len: int = 2048  # 4x longer than T4
+
+    # Data
+    dataset_name: str = "c4"
+    dataset_config: str = "en"
+    streaming: bool = True
+
+    # Logging
+    log_every: int = 50
+    eval_every: int = 500
+    save_every: int = 2500
+    output_dir: str = "checkpoints"
+
+    # Reproducibility
+    seed: int = 42
+
+    # OOM handling
+    oom_retry_batch_size: int = 8
+
+    # DDP Settings for 8 GPU training
+    num_gpus: int = 8
+    ddp_backend: str = "nccl"  # NCCL for NVIDIA GPUs
+    ddp_bucket_cap_mb: int = 25  # Gradient bucket size
+    ddp_find_unused_parameters: bool = False
+
+    # L4 Ada optimizations
+    use_tf32: bool = True  # Enable TF32 for matmuls
+    use_bf16: bool = True  # BF16 over FP16 (better range)
+    compile_model: bool = True  # torch.compile for L4
+    use_fused_adam: bool = True  # Fused optimizer kernels
+
+
+def get_l4_config(num_gpus: int = 8) -> L4Config:
+    """Get L4 configuration with DDP settings.
+
+    Args:
+        num_gpus: Number of L4 GPUs (default: 8)
+
+    Returns:
+        L4Config with optimized settings for multi-GPU training
+    """
+    config = L4Config()
+    config.num_gpus = num_gpus
+
+    # Scale effective batch size: batch_size * grad_accum * num_gpus
+    # With defaults: 16 * 4 * 8 = 512 effective batch size
+
+    return config
+
+
+@dataclass
 class ModelConfig:
     """Model configuration for RationalBitNet."""
     vocab_size: int = 50257  # GPT-2 vocab size for fair comparison
@@ -82,17 +165,23 @@ class ModelConfig:
 def get_model_config(size: str = "125M") -> ModelConfig:
     """Get model configuration for a given size.
 
-    Sizes designed to fit in T4 memory with training:
+    T4 GPU (15.6GB) sizes:
     - 50M: Very small, fast iteration, development (~36M actual params)
     - 125M: Small, fits comfortably, good for POC (~60M actual params)
     - 350M: Medium, tight fit, needs all optimizations (~167M actual params)
     - GPT2: True GPT-2 small equivalent (~162M actual params) - fits T4!
+
+    L4 GPU (24GB) sizes - for multi-GPU training:
+    - 1B: ~1B params, fits single L4 with checkpointing
+    - 3B: ~3B params, needs 2-4 L4 GPUs
+    - 7B: ~7B params, needs 8 L4 GPUs (full setup)
     """
     # GPT-2 vocab size (50257) for fair comparison with GPT-2 124M baseline
     # Using GPT-2 BPE tokenizer enables: consistent vocabulary, fair perplexity comparison
     GPT2_VOCAB_SIZE = 50257
 
     configs = {
+        # T4-compatible sizes
         "50M": ModelConfig(
             vocab_size=GPT2_VOCAB_SIZE,
             hidden_dim=384,
@@ -126,6 +215,31 @@ def get_model_config(size: str = "125M") -> ModelConfig:
             num_layers=12,
             max_seq_len=1024,
         ),
+        # L4-optimized sizes (for multi-GPU training)
+        "1B": ModelConfig(
+            vocab_size=GPT2_VOCAB_SIZE,
+            hidden_dim=2048,
+            intermediate_dim=5504,  # ~2.7x hidden (SwiGLU style)
+            num_heads=16,
+            num_layers=24,
+            max_seq_len=2048,
+        ),
+        "3B": ModelConfig(
+            vocab_size=GPT2_VOCAB_SIZE,
+            hidden_dim=3072,
+            intermediate_dim=8192,
+            num_heads=24,
+            num_layers=32,
+            max_seq_len=2048,
+        ),
+        "7B": ModelConfig(
+            vocab_size=GPT2_VOCAB_SIZE,
+            hidden_dim=4096,
+            intermediate_dim=11008,  # Llama-style ~2.7x
+            num_heads=32,
+            num_layers=32,
+            max_seq_len=4096,
+        ),
     }
 
     if size not in configs:
@@ -134,8 +248,12 @@ def get_model_config(size: str = "125M") -> ModelConfig:
     return configs[size]
 
 
-def estimate_memory(config: ModelConfig) -> dict:
+def estimate_memory(config: ModelConfig, num_gpus: int = 1) -> dict:
     """Estimate memory usage for a given configuration.
+
+    Args:
+        config: Model configuration
+        num_gpus: Number of GPUs for distributed training
 
     Returns dict with memory estimates in GB.
     """
@@ -155,6 +273,7 @@ def estimate_memory(config: ModelConfig) -> dict:
     # Memory estimates (in GB)
     fp32_size = total_params * 4 / 1e9  # FP32 weights
     fp16_size = total_params * 2 / 1e9  # FP16 weights
+    bf16_size = total_params * 2 / 1e9  # BF16 weights
 
     # Training memory (rough estimates)
     # With gradient checkpointing and 8-bit Adam:
@@ -164,12 +283,19 @@ def estimate_memory(config: ModelConfig) -> dict:
     # - Activations: ~0.5-1x weights (with checkpointing)
     training_memory = fp32_size * 3.5  # Conservative estimate
 
+    # DDP splits model across GPUs (approximate)
+    per_gpu_memory = training_memory / num_gpus if num_gpus > 1 else training_memory
+
     return {
         "total_params": total_params,
         "fp32_gb": fp32_size,
         "fp16_gb": fp16_size,
+        "bf16_gb": bf16_size,
         "training_gb": training_memory,
-        "fits_t4": training_memory < 14.0,  # Leave 1.6GB headroom
+        "per_gpu_gb": per_gpu_memory,
+        "fits_t4": per_gpu_memory < 14.0,  # Leave 1.6GB headroom
+        "fits_l4": per_gpu_memory < 22.0,  # Leave 2GB headroom for L4
+        "recommended_gpus": max(1, int(training_memory / 20) + 1),
     }
 
 

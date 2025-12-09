@@ -28,9 +28,11 @@ Training stable with zero OOM errors and zero NaN/Inf issues.
 
 ## Quick Start
 
+### Single GPU (Tesla T4)
+
 ```bash
 # Install dependencies
-pip install torch transformers datasets bitsandbytes triton
+pip install -r requirements.txt
 
 # Train 125M model on TinyStories
 python training/train.py \
@@ -41,6 +43,31 @@ python training/train.py \
     --gradient_accumulation 8 \
     --learning_rate 5e-5 \
     --warmup_steps 2000
+```
+
+### Multi-GPU (8x L4)
+
+```bash
+# Install dependencies
+pip install -r requirements.txt
+
+# Option 1: Accelerate (recommended)
+accelerate launch training/train_accelerate.py \
+    --model_size 1B \
+    --batch_size 16 \
+    --gradient_accumulation 4 \
+    --max_seq_len 2048 \
+    --use_memory
+
+# Option 2: torchrun (native PyTorch DDP)
+torchrun --nproc_per_node=8 training/train_ddp.py \
+    --model_size 1B \
+    --batch_size 16 \
+    --gradient_accumulation 4 \
+    --max_seq_len 2048
+
+# Option 3: Launch scripts
+./scripts/launch_8l4.sh 1B --use_memory
 ```
 
 ```python
@@ -144,11 +171,14 @@ Gradient checkpointing: True
 
 ### Model Sizes
 
-| Size | Params | Hidden | Layers | Heads | T4 Compatible |
-|------|--------|--------|--------|-------|---------------|
-| 125M | 78.7M | 512 | 8 | 8 | Yes |
-| 350M | 302M | 1024 | 24 | 16 | Yes |
-| 1.3B | 1.3B | 2048 | 24 | 16 | No |
+| Size | Params | Hidden | Layers | Heads | T4 | L4 | 8x L4 |
+|------|--------|--------|--------|-------|----|----|-------|
+| 50M | 36M | 384 | 6 | 6 | Yes | Yes | Yes |
+| 125M | 78.7M | 512 | 8 | 8 | Yes | Yes | Yes |
+| 350M | 302M | 768 | 12 | 12 | Yes | Yes | Yes |
+| 1B | ~1B | 2048 | 24 | 16 | No | Yes | Yes |
+| 3B | ~3B | 3072 | 32 | 24 | No | No | Yes |
+| 7B | ~7B | 4096 | 32 | 32 | No | No | Yes |
 
 ## Stage 2b: MIRAS Memory Training
 
