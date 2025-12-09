@@ -26,7 +26,140 @@ from torch.amp import autocast  # Use torch.amp for BF16 support
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from rational_bitnet import RationalBitNet, RationalBitNetConfig, compute_sparsity_penalty
+from rational_bitnet import RationalBitNet, RationalBitNetConfig, compute_sparsity_penalty, BitLinear, RationalSiLU
+
+# Import MIRAS utils for Stage 2b memory training
+try:
+    from miras_utils import (
+        MIRASMetrics,
+        MIRASAblationConfig,
+        compute_miras_metrics,
+        log_miras_metrics,
+        save_miras_checkpoint,
+        load_miras_checkpoint,
+        reset_memory_states,
+    )
+    MIRAS_UTILS_AVAILABLE = True
+except ImportError:
+    MIRAS_UTILS_AVAILABLE = False
+
+
+# =============================================================================
+# Health Metrics Computation
+# =============================================================================
+
+@torch.no_grad()
+def compute_health_metrics(model: nn.Module) -> Dict[str, Any]:
+    """Compute health metrics for BitNet training monitoring.
+
+    Tracks:
+    - Sparsity: % of zero weights (good: 20-60%, bad: >80% collapse or 0%)
+    - Scale: BitLinear weight scales (good: >1e-3, bad: <1e-4 signal death)
+    - SiLU coefficients: P(x)/Q(x) evolution (good: changing, bad: stuck at init)
+
+    Returns dict with metrics and health status.
+    """
+    # Get base model if wrapped
+    base_model = model.model if hasattr(model, 'model') else model
+
+    metrics = {
+        'sparsity': {'mean': 0.0, 'min': 1.0, 'max': 0.0, 'count': 0},
+        'scale': {'mean': 0.0, 'min': float('inf'), 'max': 0.0, 'count': 0},
+        'silu_p_norm': {'mean': 0.0, 'count': 0},
+        'silu_q_norm': {'mean': 0.0, 'count': 0},
+    }
+
+    # Iterate through modules
+    for name, module in base_model.named_modules():
+        # BitLinear sparsity and scale
+        if isinstance(module, BitLinear):
+            w = module.weight.data
+            # Compute quantized weights for sparsity
+            scale = w.abs().mean().clamp(min=1e-8)
+            w_norm = w / scale
+            w_quant = w_norm.round().clamp(-1, 1)
+
+            # Sparsity (% zeros)
+            sparsity = (w_quant == 0).float().mean().item()
+            metrics['sparsity']['mean'] += sparsity
+            metrics['sparsity']['min'] = min(metrics['sparsity']['min'], sparsity)
+            metrics['sparsity']['max'] = max(metrics['sparsity']['max'], sparsity)
+            metrics['sparsity']['count'] += 1
+
+            # Scale
+            scale_val = scale.item()
+            metrics['scale']['mean'] += scale_val
+            metrics['scale']['min'] = min(metrics['scale']['min'], scale_val)
+            metrics['scale']['max'] = max(metrics['scale']['max'], scale_val)
+            metrics['scale']['count'] += 1
+
+        # RationalSiLU coefficient evolution
+        if isinstance(module, RationalSiLU):
+            if hasattr(module, 'numerator'):
+                p_norm = module.numerator.data.norm().item()
+                metrics['silu_p_norm']['mean'] += p_norm
+                metrics['silu_p_norm']['count'] += 1
+            if hasattr(module, 'denominator'):
+                q_norm = module.denominator.data.norm().item()
+                metrics['silu_q_norm']['mean'] += q_norm
+                metrics['silu_q_norm']['count'] += 1
+
+    # Compute averages
+    for key in ['sparsity', 'scale']:
+        if metrics[key]['count'] > 0:
+            metrics[key]['mean'] /= metrics[key]['count']
+    for key in ['silu_p_norm', 'silu_q_norm']:
+        if metrics[key]['count'] > 0:
+            metrics[key]['mean'] /= metrics[key]['count']
+
+    # Health assessment
+    health = {
+        'sparsity_ok': 0.0 < metrics['sparsity']['mean'] < 0.8,
+        'scale_ok': metrics['scale']['min'] > 1e-4 if metrics['scale']['count'] > 0 else True,
+        'collapse_risk': metrics['sparsity']['mean'] > 0.8,
+        'signal_death': metrics['scale']['min'] < 1e-5 if metrics['scale']['count'] > 0 else False,
+    }
+
+    return {'metrics': metrics, 'health': health}
+
+
+def format_health_metrics(health_data: Dict, train_loss: float, eval_loss: float = None,
+                          grad_norm: float = None) -> str:
+    """Format health metrics for logging."""
+    m = health_data['metrics']
+    h = health_data['health']
+
+    lines = []
+
+    # Train/Eval gap
+    if eval_loss is not None:
+        gap = abs(train_loss - eval_loss)
+        gap_ratio = eval_loss / train_loss if train_loss > 0 else float('inf')
+        gap_status = "OK" if gap_ratio < 2.0 else "BAD"
+        lines.append(f"  Gap: {gap:.2f} ({gap_ratio:.1f}x) [{gap_status}]")
+
+    # Sparsity
+    if m['sparsity']['count'] > 0:
+        sp = m['sparsity']
+        sp_status = "OK" if h['sparsity_ok'] else ("COLLAPSE!" if h['collapse_risk'] else "LOW")
+        lines.append(f"  Sparsity: {sp['mean']*100:.1f}% (min:{sp['min']*100:.0f}%, max:{sp['max']*100:.0f}%) [{sp_status}]")
+
+    # Scale
+    if m['scale']['count'] > 0:
+        sc = m['scale']
+        sc_status = "OK" if h['scale_ok'] else "DYING!"
+        lines.append(f"  Scale: {sc['mean']:.2e} (min:{sc['min']:.2e}) [{sc_status}]")
+
+    # Grad norm
+    if grad_norm is not None:
+        gn_status = "OK" if grad_norm < 1.0 else ("HIGH" if grad_norm < 10.0 else "EXPLODING!")
+        lines.append(f"  GradNorm: {grad_norm:.4f} [{gn_status}]")
+
+    # SiLU evolution
+    if m['silu_p_norm']['count'] > 0:
+        lines.append(f"  SiLU P/Q: {m['silu_p_norm']['mean']:.4f} / {m['silu_q_norm']['mean']:.4f}")
+
+    return '\n'.join(lines)
 
 
 class GradientCheckpointWrapper(nn.Module):
@@ -66,6 +199,11 @@ class GradientCheckpointWrapper(nn.Module):
             # Final norm and LM head
             hidden_states = self.model.norm(hidden_states)
             logits = self.model.lm_head(hidden_states)
+
+            # CRITICAL FIX: Apply µP output scaling (was missing, causing train/eval mismatch!)
+            # Without this, training logits were ~11x larger than eval logits,
+            # causing artificially low training loss while eval loss stayed high.
+            logits = logits * self.model.output_scale
 
             # Compute loss
             loss = None
@@ -132,6 +270,11 @@ class UnifiedGradientCheckpointWrapper(nn.Module):
             # Final norm and LM head
             hidden_states = self.model.norm(hidden_states)
             logits = self.model.lm_head(hidden_states)
+
+            # CRITICAL FIX: Apply µP output scaling (was missing, causing train/eval mismatch!)
+            # Without this, training logits were ~11x larger than eval logits,
+            # causing artificially low training loss while eval loss stayed high.
+            logits = logits * self.model.output_scale
 
             # Compute loss
             loss = None
@@ -346,9 +489,30 @@ class ILVMTrainer:
         self.current_batch_size = train_config.batch_size
         self.oom_count = 0
 
+        # Health metrics tracking
+        self.last_grad_norm = 0.0
+        self.last_eval_loss = None
+        self.health_log_every = 500  # Log full health metrics less frequently
+
         # Output directory
         self.output_dir = Path(train_config.output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
+
+        # MIRAS memory tracking (for Stage 2b with UnifiedILVM)
+        self.memory_states = None
+        self.ablation_config = None
+        self.is_miras_model = self._detect_miras_model()
+        self.miras_log_every = 500  # Log MIRAS metrics less frequently
+
+        if self.is_miras_model and MIRAS_UTILS_AVAILABLE:
+            print("MIRAS memory model detected - tracking memory states")
+
+    def _detect_miras_model(self) -> bool:
+        """Detect if model has MIRAS memory layers."""
+        model = self.model.model if hasattr(self.model, 'model') else self.model
+        if hasattr(model, 'layers') and len(model.layers) > 0:
+            return hasattr(model.layers[0], 'use_memory')
+        return False
 
     def _handle_oom(self):
         """Handle OOM by reducing batch size."""
@@ -463,8 +627,12 @@ class ILVMTrainer:
             else:
                 raise e
 
-    def optimizer_step(self):
-        """Execute optimizer step with NaN-safe gradient clipping."""
+    def optimizer_step(self) -> float:
+        """Execute optimizer step with NaN-safe gradient clipping.
+
+        Returns:
+            grad_norm: The gradient norm (pre-clipping), or -1 if skipped
+        """
         if self.scaler is not None:
             self.scaler.unscale_(self.optimizer)
 
@@ -481,7 +649,7 @@ class ILVMTrainer:
             self.optimizer.zero_grad()
             if self.scaler is not None:
                 self.scaler.update()
-            return
+            return -1.0
 
         # Aggressive gradient clipping (0.5 instead of 1.0 for rational networks)
         grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -495,7 +663,7 @@ class ILVMTrainer:
             self.optimizer.zero_grad()
             if self.scaler is not None:
                 self.scaler.update()
-            return
+            return grad_norm.item() if hasattr(grad_norm, 'item') else grad_norm
 
         if self.scaler is not None:
             self.scaler.step(self.optimizer)
@@ -503,8 +671,11 @@ class ILVMTrainer:
         else:
             self.optimizer.step()
 
+        # These must happen BEFORE returning
         self.scheduler.step()
         self.optimizer.zero_grad()
+
+        return grad_norm.item() if hasattr(grad_norm, 'item') else grad_norm
 
     @torch.no_grad()
     def evaluate(self) -> Dict[str, float]:
@@ -548,7 +719,7 @@ class ILVMTrainer:
         return {"val_loss": avg_loss, "val_perplexity": perplexity}
 
     def save_checkpoint(self, is_best: bool = False):
-        """Save model checkpoint."""
+        """Save model checkpoint with optional MIRAS data."""
         checkpoint = {
             "model_state_dict": self.model.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
@@ -557,6 +728,17 @@ class ILVMTrainer:
             "best_loss": self.best_loss,
             "model_config": asdict(self.model_config) if hasattr(self.model_config, '__dataclass_fields__') else self.model_config.__dict__,
         }
+
+        # Add MIRAS-specific data if available
+        if self.is_miras_model and MIRAS_UTILS_AVAILABLE:
+            model = self.model.model if hasattr(self.model, 'model') else self.model
+            miras_metrics = compute_miras_metrics(model, self.memory_states)
+            checkpoint = save_miras_checkpoint(
+                checkpoint,
+                self.memory_states,
+                self.ablation_config,
+                miras_metrics,
+            )
 
         # Save latest
         torch.save(checkpoint, self.output_dir / "checkpoint_latest.pt")
@@ -607,7 +789,8 @@ class ILVMTrainer:
 
             # Optimizer step after accumulation
             if accumulated_steps >= self.train_config.gradient_accumulation_steps:
-                self.optimizer_step()
+                # Capture grad_norm from optimizer step
+                self.last_grad_norm = self.optimizer_step()
                 self.global_step += 1
 
                 avg_loss = accumulated_loss / accumulated_steps
@@ -624,12 +807,36 @@ class ILVMTrainer:
                           f"Steps/s: {steps_per_sec:.2f} | "
                           f"OOM: {self.oom_count}")
 
+                    # Health metrics logging (full report at health_log_every)
+                    if self.global_step % self.health_log_every == 0:
+                        health_data = compute_health_metrics(self.model)
+                        health_str = format_health_metrics(
+                            health_data,
+                            train_loss=avg_loss,
+                            eval_loss=self.last_eval_loss,
+                            grad_norm=self.last_grad_norm,
+                        )
+                        print("  Health Metrics:")
+                        print(health_str)
+
+                # MIRAS memory metrics logging (less frequent)
+                if (self.is_miras_model and MIRAS_UTILS_AVAILABLE and
+                    self.global_step % self.miras_log_every == 0):
+                    model = self.model.model if hasattr(self.model, 'model') else self.model
+                    miras_metrics = compute_miras_metrics(model, self.memory_states)
+                    print(log_miras_metrics(miras_metrics, self.global_step, prefix="  "))
+
                 # Evaluation
                 if self.global_step % self.train_config.eval_every == 0:
                     eval_metrics = self.evaluate()
                     if eval_metrics:
+                        self.last_eval_loss = eval_metrics['val_loss']  # Track for health metrics
+                        # Compute train/eval gap
+                        gap_ratio = eval_metrics['val_loss'] / avg_loss if avg_loss > 0 else float('inf')
+                        gap_status = "OK" if gap_ratio < 2.0 else ("WARN" if gap_ratio < 4.0 else "BAD")
                         print(f"  Eval - Loss: {eval_metrics['val_loss']:.4f} | "
-                              f"PPL: {eval_metrics['val_perplexity']:.2f}")
+                              f"PPL: {eval_metrics['val_perplexity']:.2f} | "
+                              f"Gap: {gap_ratio:.1f}x [{gap_status}]")
 
                         # Save best
                         if eval_metrics['val_loss'] < self.best_loss:

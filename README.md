@@ -107,7 +107,8 @@ bitnet-odp/
 ├── src/
 │   ├── rational_bitnet.py    # Core model: BitLinear, RationalOps, Attention
 │   ├── triton_rational.py    # Fused Triton kernels
-│   ├── miras_memory.py       # MIRAS persistent memory
+│   ├── miras_memory.py       # MIRAS persistent memory (sequential)
+│   ├── miras_memory_fla.py   # MIRAS with FLA Triton kernels (15x faster)
 │   └── unified_ilvm.py       # Unified architecture
 ├── training/
 │   ├── train.py              # Training entry point
@@ -117,7 +118,8 @@ bitnet-odp/
 ├── tests/
 │   ├── test_odp_operators.py # Rational operator tests
 │   ├── test_titans_architecture.py
-│   └── test_miras_memory.py
+│   ├── test_miras_memory.py  # Sequential MIRAS tests
+│   └── test_miras_fla.py     # FLA-optimized MIRAS tests (30 tests)
 ├── docs/
 │   └── BLUE_PAPER.md         # Technical specification
 └── archive/
@@ -147,6 +149,139 @@ Gradient checkpointing: True
 | 125M | 78.7M | 512 | 8 | 8 | Yes |
 | 350M | 302M | 1024 | 24 | 16 | Yes |
 | 1.3B | 1.3B | 2048 | 24 | 16 | No |
+
+## Stage 2b: MIRAS Memory Training
+
+After Stage 1 completes (BitNet + ODP validation), enable MIRAS memory for long-range retrieval:
+
+```bash
+# Train with MIRAS memory (multi-timescale retention + DeltaNet)
+python training/train.py \
+    --model_size 125M \
+    --use_memory \
+    --dataset fineweb-edu \
+    --max_steps 50000 \
+    --batch_size 4 \
+    --gradient_accumulation 8 \
+    --learning_rate 5e-5 \
+    --warmup_steps 2000
+```
+
+### MIRAS Memory Features
+
+| Component | Function |
+|-----------|----------|
+| Multi-timescale Retention | Fast (0.9), Medium (0.99), Slow (0.999) decay rates |
+| DeltaNet Delta Rule | Key overwriting: S = S - beta * outer(error, k) / ||k||^2 |
+| Huber Loss | Robust gradients, less sensitive to outliers |
+| Learnable Weights | Automatic timescale mixing per layer |
+
+### Ablation Configurations
+
+```python
+from training.miras_utils import get_ablation_config
+
+# Available configs:
+# - full: All features enabled
+# - no_memory: Baseline (no memory)
+# - single_timescale: One retention rate only
+# - no_deltanet: Disable key overwriting
+# - no_huber: Use L2 instead of Huber
+# - fast_only / slow_only: Single timescale experiments
+# - memory_last_half / memory_every_4th: Sparse memory layers
+```
+
+### Memory Metrics Logged
+
+Every 500 steps with `--use_memory`:
+- Retention rates (learned)
+- Timescale combination weights
+- Memory utilization (Frobenius norm)
+- Memory sparsity
+- Memory gradient norm
+
+## FLA Triton Optimization
+
+MIRAS memory uses Flash Linear Attention (FLA) Triton kernels for 15x+ speedup:
+
+### Performance Benchmarks (Tesla T4)
+
+| Implementation | Time per Forward | Throughput | Speedup |
+|----------------|------------------|------------|---------|
+| Sequential DeltaNet | ~115 ms | ~17k tokens/sec | 1x |
+| FLA DeltaNet (chunk) | ~7.5 ms | ~270k tokens/sec | 15.2x |
+| FLA DeltaNet (fused_recurrent) | ~4.8 ms | ~420k tokens/sec | 23.7x |
+
+### Installation
+
+```bash
+pip install flash-linear-attention
+```
+
+### Usage
+
+```python
+from src.miras_memory_fla import (
+    MIRASFLAConfig,
+    OptimizedFLADeltaNet,
+    MultiTimescaleFLADeltaNet,
+    MIRASFLAMemoryAttention,
+    MIRASFLABlock,
+)
+
+config = MIRASFLAConfig(
+    hidden_dim=512,
+    num_heads=8,
+    num_timescales=3,
+)
+
+# Fast mode: single DeltaNet with fused_recurrent (max speed)
+memory = MultiTimescaleFLADeltaNet(config, mode='fast')
+
+# Accurate mode: separate DeltaNets per timescale (more control)
+memory = MultiTimescaleFLADeltaNet(config, mode='accurate')
+
+# Full memory attention block
+block = MIRASFLABlock(config)
+output, state = block(x, use_cache=True)
+```
+
+### Architecture
+
+```
+Input
+  │
+  ├─────────────────────────────────────┐
+  │                                     │
+  ▼                                     ▼
+OptimizedFLADeltaNet              (accurate mode only)
+(fused_recurrent mode)            Multi-DeltaNet layers
+  │                                     │
+  ├─────────────────────────────────────┤
+  │                                     │
+  ▼                                     ▼
+BitLinear Output Projection       Weighted Combine
+  │                                     │
+  └─────────────────────────────────────┘
+                  │
+                  ▼
+               Output
+```
+
+### Key Optimizations
+
+| Optimization | Description |
+|--------------|-------------|
+| Triton Kernels | Chunkwise-parallel DeltaNet from NeurIPS 2024 paper |
+| Fused Recurrent | Single kernel for entire recurrence (23.7x speedup) |
+| Parallel Associative Scan | Process all sequence chunks simultaneously |
+| BitLinear Integration | Ternary weights for ZK/FHE compatibility |
+| Multi-head Multi-timescale | Implicit timescale via learned per-head retention |
+
+### References
+
+- FLA: https://github.com/fla-org/flash-linear-attention
+- DeltaNet Paper: "Parallelizing Linear Transformers with Delta Rule" (NeurIPS 2024)
 
 ## Applications
 
