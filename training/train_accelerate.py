@@ -149,7 +149,7 @@ class AccelerateTrainer:
         self.best_loss = float('inf')
 
     def train_step(self, batch):
-        """Single training step."""
+        """Single training step (one micro-batch forward/backward)."""
         self.model.train()
 
         # Move batch to device (needed when not using Accelerate dataloader wrapping)
@@ -158,18 +158,9 @@ class AccelerateTrainer:
         if isinstance(labels, torch.Tensor):
             labels = labels.to(self.accelerator.device)
 
-        # Debug: Log before forward pass (only on first few steps)
-        if self.global_step < 3:
-            self.accelerator.print(f"[Step {self.global_step}] Starting forward pass...")
-            import sys
-            sys.stdout.flush()
-
         # Forward with mixed precision (handled by Accelerate)
         outputs = self.model(input_ids)
 
-        # Debug: Log after forward pass
-        if self.global_step < 3:
-            self.accelerator.print(f"[Step {self.global_step}] Forward pass complete.")
         # Handle different output formats: dict (UnifiedILVM), tuple, or tensor
         if isinstance(outputs, dict):
             logits = outputs["logits"]
@@ -194,26 +185,18 @@ class AccelerateTrainer:
             ignore_index=-100,
         )
 
-        # Debug: Log before backward pass
-        if self.global_step < 3:
-            self.accelerator.print(f"[Step {self.global_step}] Loss: {loss.item():.4f}, starting backward...")
-            import sys
-            sys.stdout.flush()
-
-        # Backward (Accelerate handles gradient accumulation)
+        # Backward
         self.accelerator.backward(loss)
-
-        # Debug: Log after backward pass
-        if self.global_step < 3:
-            self.accelerator.print(f"[Step {self.global_step}] Backward pass complete.")
 
         return loss.item()
 
     def optimizer_step(self):
-        """Optimizer step with gradient clipping."""
-        # Clip gradients
-        if self.accelerator.sync_gradients:
-            self.accelerator.clip_grad_norm_(self.model.parameters(), self.config.gradient_clip)
+        """Optimizer step with gradient clipping.
+
+        Called only after all gradient accumulation steps complete.
+        """
+        # Clip gradients (always clip since we only call this after accumulation)
+        self.accelerator.clip_grad_norm_(self.model.parameters(), self.config.gradient_clip)
 
         self.optimizer.step()
         self.scheduler.step()
@@ -282,7 +265,13 @@ class AccelerateTrainer:
         }, path)
 
     def train(self):
-        """Main training loop."""
+        """Main training loop with manual gradient accumulation.
+
+        NOTE: We use manual gradient accumulation instead of accelerator.accumulate()
+        because our IterableDataset is not wrapped by Accelerate (to support streaming
+        with split_dataset_by_node sharding). The accumulate() context manager doesn't
+        track iterations properly without a wrapped dataloader.
+        """
         self.accelerator.print("=" * 70)
         self.accelerator.print("ACCELERATE MULTI-GPU TRAINING")
         self.accelerator.print("=" * 70)
@@ -300,6 +289,8 @@ class AccelerateTrainer:
 
         accumulation_loss = 0.0
         step_times = []
+        step_start = time.perf_counter()
+        accum_step = 0  # Track micro-batch count for gradient accumulation
 
         self.accelerator.print("Starting training loop...")
         self.accelerator.print("Waiting for first batch from dataloader...")
@@ -310,56 +301,64 @@ class AccelerateTrainer:
             if self.global_step >= self.config.max_steps:
                 break
 
-            step_start = time.perf_counter()
+            # Determine if this is an accumulation step (no sync) or sync step
+            is_accumulation_step = (accum_step + 1) < self.config.gradient_accumulation_steps
 
-            # Training step with gradient accumulation context
-            with self.accelerator.accumulate(self.model):
+            # Use no_sync context for accumulation steps to avoid gradient all-reduce
+            if is_accumulation_step:
+                with self.accelerator.no_sync(self.model):
+                    loss = self.train_step(batch)
+                    accumulation_loss += loss
+                accum_step += 1
+            else:
+                # Final accumulation step - allow gradient sync across GPUs
                 loss = self.train_step(batch)
                 accumulation_loss += loss
 
-                # Only step optimizer when gradients are synced
-                if self.accelerator.sync_gradients:
-                    self.optimizer_step()
-                    self.global_step += 1
+                # Now do optimizer step
+                self.optimizer_step()
+                self.global_step += 1
+                accum_step = 0  # Reset accumulation counter
 
-                    step_time = time.perf_counter() - step_start
-                    step_times.append(step_time)
+                step_time = time.perf_counter() - step_start
+                step_times.append(step_time)
+                step_start = time.perf_counter()  # Reset for next step
 
-                    # Logging
-                    if self.global_step % self.config.log_every == 0:
-                        avg_loss = accumulation_loss / self.config.gradient_accumulation_steps
-                        lr = self.scheduler.get_last_lr()[0]
-                        avg_step_time = sum(step_times[-10:]) / len(step_times[-10:])
-                        tokens_per_sec = (
-                            self.config.batch_size *
-                            self.config.max_seq_len *
-                            self.config.gradient_accumulation_steps *
-                            self.accelerator.num_processes
-                        ) / avg_step_time
+                # Logging
+                if self.global_step % self.config.log_every == 0:
+                    avg_loss = accumulation_loss / self.config.gradient_accumulation_steps
+                    lr = self.scheduler.get_last_lr()[0]
+                    avg_step_time = sum(step_times[-10:]) / len(step_times[-10:])
+                    tokens_per_sec = (
+                        self.config.batch_size *
+                        self.config.max_seq_len *
+                        self.config.gradient_accumulation_steps *
+                        self.accelerator.num_processes
+                    ) / avg_step_time
 
-                        self.accelerator.print(
-                            f"Step {self.global_step:6d} | "
-                            f"Loss: {avg_loss:.4f} | "
-                            f"LR: {lr:.2e} | "
-                            f"Tok/s: {tokens_per_sec:,.0f}"
-                        )
+                    self.accelerator.print(
+                        f"Step {self.global_step:6d} | "
+                        f"Loss: {avg_loss:.4f} | "
+                        f"LR: {lr:.2e} | "
+                        f"Tok/s: {tokens_per_sec:,.0f}"
+                    )
 
-                    accumulation_loss = 0.0
+                accumulation_loss = 0.0
 
-                    # Evaluation
-                    if self.global_step % self.config.eval_every == 0:
-                        eval_loss = self.evaluate()
-                        self.accelerator.print(f"  Eval loss: {eval_loss:.4f}")
+                # Evaluation
+                if self.global_step % self.config.eval_every == 0:
+                    eval_loss = self.evaluate()
+                    self.accelerator.print(f"  Eval loss: {eval_loss:.4f}")
 
-                        if eval_loss < self.best_loss:
-                            self.best_loss = eval_loss
-                            self.save_checkpoint(f"{self.config.output_dir}/best_model.pt")
+                    if eval_loss < self.best_loss:
+                        self.best_loss = eval_loss
+                        self.save_checkpoint(f"{self.config.output_dir}/best_model.pt")
 
-                    # Save checkpoint
-                    if self.global_step % self.config.save_every == 0:
-                        self.save_checkpoint(
-                            f"{self.config.output_dir}/checkpoint_step{self.global_step}.pt"
-                        )
+                # Save checkpoint
+                if self.global_step % self.config.save_every == 0:
+                    self.save_checkpoint(
+                        f"{self.config.output_dir}/checkpoint_step{self.global_step}.pt"
+                    )
 
         # Final save
         self.save_checkpoint(f"{self.config.output_dir}/final_model.pt")
