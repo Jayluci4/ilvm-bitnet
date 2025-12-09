@@ -386,20 +386,18 @@ def main():
     optimizer = create_optimizer(model, config)
     scheduler = create_scheduler(optimizer, config, config.max_steps)
 
-    # Create data loaders
+    # Create data loaders (streaming is enabled by default in data_loader.py)
     accelerator.print("Creating data loaders...")
     train_dataloader = create_dataloader(
         dataset_name=config.dataset_name,
         batch_size=config.batch_size,
         max_seq_len=config.max_seq_len,
-        streaming=True,
     )
 
     eval_dataloader = create_dataloader(
         dataset_name=config.dataset_name,
         batch_size=config.eval_batch_size,
         max_seq_len=config.max_seq_len,
-        streaming=True,
         split="validation",
     )
 
