@@ -157,9 +157,10 @@ class AccelerateTrainer:
             shift_logits = shift_logits[:, :min_len, :]
             shift_labels = shift_labels[:, :min_len]
 
+        # Use reshape instead of view for non-contiguous tensors
         loss = nn.functional.cross_entropy(
-            shift_logits.view(-1, shift_logits.size(-1)),
-            shift_labels.view(-1),
+            shift_logits.reshape(-1, shift_logits.size(-1)),
+            shift_labels.reshape(-1),
             ignore_index=-100,
         )
 
@@ -209,9 +210,10 @@ class AccelerateTrainer:
                 shift_logits = shift_logits[:, :min_len, :]
                 shift_labels = shift_labels[:, :min_len]
 
+            # Use reshape instead of view for non-contiguous tensors
             loss = nn.functional.cross_entropy(
-                shift_logits.view(-1, shift_logits.size(-1)),
-                shift_labels.view(-1),
+                shift_logits.reshape(-1, shift_logits.size(-1)),
+                shift_labels.reshape(-1),
                 ignore_index=-100,
             )
             total_loss += loss.item()
