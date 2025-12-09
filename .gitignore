@@ -1,4 +1,7 @@
 archive/
+docs/
+checkpoints/
+.gitignore
 __pycache__
 checkpoints
 *.log
