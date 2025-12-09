@@ -158,8 +158,18 @@ class AccelerateTrainer:
         if isinstance(labels, torch.Tensor):
             labels = labels.to(self.accelerator.device)
 
+        # Debug: Log before forward pass (only on first few steps)
+        if self.global_step < 3:
+            self.accelerator.print(f"[Step {self.global_step}] Starting forward pass...")
+            import sys
+            sys.stdout.flush()
+
         # Forward with mixed precision (handled by Accelerate)
         outputs = self.model(input_ids)
+
+        # Debug: Log after forward pass
+        if self.global_step < 3:
+            self.accelerator.print(f"[Step {self.global_step}] Forward pass complete.")
         # Handle different output formats: dict (UnifiedILVM), tuple, or tensor
         if isinstance(outputs, dict):
             logits = outputs["logits"]
@@ -184,8 +194,18 @@ class AccelerateTrainer:
             ignore_index=-100,
         )
 
+        # Debug: Log before backward pass
+        if self.global_step < 3:
+            self.accelerator.print(f"[Step {self.global_step}] Loss: {loss.item():.4f}, starting backward...")
+            import sys
+            sys.stdout.flush()
+
         # Backward (Accelerate handles gradient accumulation)
         self.accelerator.backward(loss)
+
+        # Debug: Log after backward pass
+        if self.global_step < 3:
+            self.accelerator.print(f"[Step {self.global_step}] Backward pass complete.")
 
         return loss.item()
 
