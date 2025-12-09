@@ -34,7 +34,8 @@ mkdir -p checkpoints
 # Run with Accelerate
 if [ "$USE_MEMORY" == "--use_memory" ]; then
     echo "Training with MIRAS memory enabled"
-    echo "NOTE: Using reduced batch_size=4 and seq_len=1024 for MIRAS memory overhead"
+    echo "NOTE: Using batch_size=2, seq_len=512, grad_accum=16 for MIRAS memory overhead"
+    echo "Effective batch size: 2 * 16 * 8 = 256"
     echo "Dataset: TinyStories (Stage 1 validation)"
     accelerate launch \
         --config_file scripts/accelerate_config_8l4.yaml \
@@ -42,9 +43,9 @@ if [ "$USE_MEMORY" == "--use_memory" ]; then
         --model_size "$MODEL_SIZE" \
         --use_memory \
         --dataset tinystories \
-        --batch_size 4 \
-        --gradient_accumulation 8 \
-        --max_seq_len 1024 \
+        --batch_size 2 \
+        --gradient_accumulation 16 \
+        --max_seq_len 512 \
         --learning_rate 1e-4 \
         --warmup_steps 4000 \
         --max_steps 200000 \
